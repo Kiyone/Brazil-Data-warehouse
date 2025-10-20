@@ -1,0 +1,9 @@
+# macOS / venv
+.DS_Store
+.venv/
+
+# 生データと巨大成果物はコミットしない
+DATA/
+WAREHOUSE/*.duckdb
+WAREHOUSE/*.csv
+*.parquet
