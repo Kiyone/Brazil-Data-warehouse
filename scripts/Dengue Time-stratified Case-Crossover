@@ -1,0 +1,182 @@
+---
+title: "Dengue in Brazil --Time-stratified Case-Crossover in All Brazilian states"
+author: "Yuki Kiyomoto"
+date: "2025-10-21"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## 0)Packages
+```{r}
+# Load required libraries
+# install.packages( c("DBI","duckdb","data.table","lubridate","gnm","dlnm","ggplot2","mgcv","dplyr"),repos = "https://cloud.r-project.org")
+library(DBI); library(duckdb) # DuckDB related
+library(lubridate) # Dates+epiweeks
+library(data.table); library(lubridate)
+library(gnm); library(dlnm); library(ggplot2) # Conditional Poisson (eliminate) # DLNM basis/pred # Plotting
+library(mgcv); library(splines); library(dplyr) # GAMs 
+```
+## 1) Data Preparation
+```{r}
+db_path <- "/Users/kiyomotoyuuki/projects/Brazil Data/WAREHOUSE/dores.duckdb"
+year_min <- 2003; year_max <- 2023
+uf_filter <- NULL        # e.g., c("AC","AM") to test smaller data
+```
+## 2) connection check to data-base
+```{r}
+stopifnot(file.exists(db_path))
+if (!exists("con") || !DBI::dbIsValid(con)) {
+  con <- dbConnect(duckdb::duckdb(), dbdir = db_path, read_only = TRUE)
+}
+```
+
+## 3) Build state*day table with dengue deaths + weather windows (SQL)
+
+```{r}
+uf_clause <- if (length(uf_filter)) paste0(" AND uf IN ('", paste(uf_filter, collapse="','"), "')") else ""
+sql_fix <- sprintf("
+WITH ufs AS (
+  SELECT DISTINCT uf FROM dores_clean
+  WHERE year BETWEEN %d AND %d %s
+),
+cal AS (  -- UF×全日（7670行/UF）
+  SELECT u.uf, d.date
+  FROM ufs u
+  CROSS JOIN range(DATE '2003-01-01', DATE '2023-12-31', INTERVAL 1 DAY) AS d(date)
+),
+deaths AS (
+  SELECT uf, CAST(date_death AS DATE) AS date, COUNT(*) AS deaths
+  FROM dores_clean
+  WHERE year BETWEEN %d AND %d AND icd10_underlying IN ('A90','A91') %s
+  GROUP BY 1,2
+),
+wx_daily AS (   -- 「その日そのUFにある死亡レコード」から日次天気を集約
+  SELECT
+    uf, CAST(date_death AS DATE) AS date,
+    AVG(temp_mean_c)             AS tmean,
+    AVG(temp_max_c)              AS tmax,
+    AVG(temp_min_c)              AS tmin,
+    AVG(temp_max_c - temp_min_c) AS diurnal,
+    AVG(precip_mm_mean)          AS precip_mm_mean,
+    MAX(precip_mm_max)           AS precip_mm_max
+  FROM dores_clean
+  WHERE year BETWEEN %d AND %d %s
+  GROUP BY 1,2
+),
+wx_roll AS (     -- カレンダーに張り付けてから移動窓を計算
+  SELECT
+    c.uf, c.date,
+    w.tmean, w.tmax, w.tmin, w.diurnal, w.precip_mm_mean, w.precip_mm_max,
+    AVG(w.tmean)          OVER (PARTITION BY c.uf ORDER BY c.date
+                                ROWS BETWEEN 6  PRECEDING AND CURRENT ROW) AS tmean_7d,
+    SUM(w.precip_mm_mean) OVER (PARTITION BY c.uf ORDER BY c.date
+                                ROWS BETWEEN 6  PRECEDING AND CURRENT ROW) AS precip_7d,
+    AVG(w.diurnal)        OVER (PARTITION BY c.uf ORDER BY c.date
+                                ROWS BETWEEN 6  PRECEDING AND CURRENT ROW) AS diurnal_7d,
+    AVG(w.tmean)          OVER (PARTITION BY c.uf ORDER BY c.date
+                                ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS tmean_14d,
+    SUM(w.precip_mm_mean) OVER (PARTITION BY c.uf ORDER BY c.date
+                                ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS precip_14d
+  FROM cal c
+  LEFT JOIN wx_daily w USING (uf, date)
+)
+SELECT
+  c.uf, c.date,
+  COALESCE(d.deaths, 0) AS deaths,   -- デング死は0埋め
+  r.tmean, r.tmax, r.tmin, r.diurnal, r.precip_mm_mean, r.precip_mm_max,
+  r.tmean_7d, r.precip_7d, r.diurnal_7d, r.tmean_14d, r.precip_14d
+FROM cal c
+LEFT JOIN deaths  d USING (uf, date)
+LEFT JOIN wx_roll r USING (uf, date)
+ORDER BY uf, date;
+", year_min, year_max, uf_clause, year_min, year_max, uf_clause,
+   year_min, year_max, uf_clause)
+
+dat <- as.data.table(DBI::dbGetQuery(con, sql_fix))
+dat[, date := as.IDate(date)]
+```
+
+## 4) Making Time-strata for dow, year and month.
+```{r}
+# Max precipitation >50mm → 1
+dat[, ex_prec := as.integer(precip_mm_max >= 50)]
+
+# Strata 
+dat[, `:=`(
+  week = lubridate::isoweek(date),
+  dow  = lubridate::wday(date, label=TRUE, week_start=7),
+  yr   = lubridate::year(date),
+  mo   = lubridate::month(date)
+)]
+dat[, stratum := interaction(uf, yr, mo, dow, drop=TRUE)]
+
+# optional: drop early rows where 7/14d windows are NA
+dat <- dat[!is.na(tmean_7d) & !is.na(precip_7d) & !is.na(diurnal_7d)]
+
+```
+
+## 5) Conditional Poisson model (case-crossover design) (UF*day)
+
+```{r}
+kT  <- quantile(dat$tmean, c(.10,.75,.90), na.rm=TRUE)
+cbT <- crossbasis(dat$tmean,
+                  argvar=list(fun="bs", knots=kT),
+                  lag=21, arglag=list(fun="bs", df=3))
+
+fit_dlnm <- gnm(
+  deaths ~ cbT + precip_7d + diurnal_7d + tmax ,
+  eliminate = stratum, family = quasipoisson(), data = dat
+  )
+# as.factor(week) deleted since the aggregated data is already considering the week.
+# ex_prec :Max=17.7049 < 50
+# > summary(dat$precip_mm_max)
+#    Min.  1st Qu.   Median     Mean  3rd Qu.     Max. 
+# 0.00000  0.04762  0.22381  0.64408  0.91704 17.70490 
+#> max(dat$precip_mm_max, na.rm = TRUE)
+# [1] 17.7049
+
+#fit_dlnm <- gnm(
+#  deaths ~ cbT + precip_7d + diurnal_7d + ex_prec + tmax + as.factor(week),
+#  eliminate = stratum, family = quasipoisson(), data = dat
+#  )
+summary(fit_dlnm)
+```
+
+## 6)  Import ONI data.
+```{r}
+oni_raw <- read.csv("/Users/kiyomotoyuuki/projects/Brazil Data/DATA/Cold & Warm Episodes by Season.csv")
+cn <- tolower(names(oni_raw))
+setnames(oni_raw, tolower(names(oni_raw)))
+setDT(oni_raw)
+cols <- intersect(c("djf","jfm","fma","mam","amj","mjj","jja","jas","aso","son","ond","ndj"),
+                  names(oni_raw))
+stopifnot("year" %in% names(oni_raw), length(cols)>0)
+
+tmp <- data.table::melt(oni_raw, id.vars="year", measure.vars=cols,
+                        variable.name="season", value.name="ONI",
+                        variable.factor=FALSE)
+
+#（DJF=Jan=1, …, NDJ=Dec=12）
+map <- c(DJF=1,JFM=2,FMA=3,MAM=4,AMJ=5,MJJ=6,JJA=7,JAS=8,ASO=9,SON=10,OND=11,NDJ=12)
+tmp[, Month := unname(map[toupper(season)])]
+oni_long <- tmp[, .(Year=as.integer(year), Month=as.integer(Month), ONI=as.numeric(ONI))][!is.na(ONI)]
+oni_long[, ym := as.IDate(sprintf("%04d-%02d-01", Year, Month))]
+
+# dat merge
+dat[, ym := as.IDate(format(date, "%Y-%m-01"))]
+dat <- merge(dat, oni_long[, .(ym, ONI)], by="ym", all.x=TRUE)
+dat[, ONI_phase := fifelse(ONI >= 0.5, "ElNino",
+                    fifelse(ONI <= -0.5, "LaNina", "Neutral"))]
+```
+
+## 7) Save CSV
+```{r}
+dir.create("outputs", showWarnings = FALSE)
+fwrite(dat, "outputs/uf_day_dengue_wx.csv")
+saveRDS(fit_dlnm, "outputs/fit_ccopoisson_uf.rds")
+dir.create("outputs", showWarnings = FALSE)
+save.image(file = "outputs/session_YYYYMMDD.RData") 
+# 
+dbDisconnect(con)  # disconnect when done
+```
