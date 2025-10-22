@@ -1,0 +1,225 @@
+---
+title: "Dengue in Brazil --Descriptive Analysis"
+author: "Yuki Kiyomoto"
+date: "2025-10-21"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## 0)Packages
+
+```{r}
+# Load required libraries
+# install.packages( c("DBI","duckdb","data.table","lubridate","gnm","dlnm","ggplot2","mgcv","dplyr"),repos = "https://cloud.r-project.org")
+library(DBI); library(duckdb) # DuckDB related
+library(lubridate) # Dates+epiweeks
+library(data.table); library(lubridate)
+library(gnm); library(dlnm); library(ggplot2) # Conditional Poisson (eliminate) # DLNM basis/pred # Plotting
+library(mgcv); library(splines); library(dplyr) # GAMs 
+```
+
+## 1) Data Preparation
+```{r}
+db_path <- "/Users/kiyomotoyuuki/projects/Brazil Data/WAREHOUSE/dores.duckdb"
+year_min <- 2003; year_max <- 2023
+uf_filter <- NULL        # e.g., c("AC","AM") to test smaller data
+```
+## 2) connection check to data-base
+```{r}
+stopifnot(file.exists(db_path))
+if (!exists("con") || !DBI::dbIsValid(con)) {
+  con <- dbConnect(duckdb::duckdb(), dbdir = db_path, read_only = TRUE)
+}
+```
+## 3) Build state*day table with dengue deaths + weather windows (SQL)
+```{r}
+uf_clause <- if (length(uf_filter)) paste0(" AND uf IN ('", paste(uf_filter, collapse="','"), "')") else ""
+sql_fix <- sprintf("
+WITH ufs AS (
+  SELECT DISTINCT uf FROM dores_clean
+  WHERE year BETWEEN %d AND %d %s
+),
+cal AS (  -- UF×全日（7670行/UF）
+  SELECT u.uf, d.date
+  FROM ufs u
+  CROSS JOIN range(DATE '2003-01-01', DATE '2023-12-31', INTERVAL 1 DAY) AS d(date)
+),
+deaths AS (
+  SELECT uf, CAST(date_death AS DATE) AS date, COUNT(*) AS deaths
+  FROM dores_clean
+  WHERE year BETWEEN %d AND %d AND icd10_underlying IN ('A90','A91') %s
+  GROUP BY 1,2
+),
+wx_daily AS (   -- 「その日そのUFにある死亡レコード」から日次天気を集約
+  SELECT
+    uf, CAST(date_death AS DATE) AS date,
+    AVG(temp_mean_c)             AS tmean,
+    AVG(temp_max_c)              AS tmax,
+    AVG(temp_min_c)              AS tmin,
+    AVG(temp_max_c - temp_min_c) AS diurnal,
+    AVG(precip_mm_mean)          AS precip_mm_mean,
+    MAX(precip_mm_max)           AS precip_mm_max
+  FROM dores_clean
+  WHERE year BETWEEN %d AND %d %s
+  GROUP BY 1,2
+),
+wx_roll AS (     -- カレンダーに張り付けてから移動窓を計算
+  SELECT
+    c.uf, c.date,
+    w.tmean, w.tmax, w.tmin, w.diurnal, w.precip_mm_mean, w.precip_mm_max,
+    AVG(w.tmean)          OVER (PARTITION BY c.uf ORDER BY c.date
+                                ROWS BETWEEN 6  PRECEDING AND CURRENT ROW) AS tmean_7d,
+    SUM(w.precip_mm_mean) OVER (PARTITION BY c.uf ORDER BY c.date
+                                ROWS BETWEEN 6  PRECEDING AND CURRENT ROW) AS precip_7d,
+    AVG(w.diurnal)        OVER (PARTITION BY c.uf ORDER BY c.date
+                                ROWS BETWEEN 6  PRECEDING AND CURRENT ROW) AS diurnal_7d,
+    AVG(w.tmean)          OVER (PARTITION BY c.uf ORDER BY c.date
+                                ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS tmean_14d,
+    SUM(w.precip_mm_mean) OVER (PARTITION BY c.uf ORDER BY c.date
+                                ROWS BETWEEN 13 PRECEDING AND CURRENT ROW) AS precip_14d
+  FROM cal c
+  LEFT JOIN wx_daily w USING (uf, date)
+)
+SELECT
+  c.uf, c.date,
+  COALESCE(d.deaths, 0) AS deaths,   -- デング死は0埋め
+  r.tmean, r.tmax, r.tmin, r.diurnal, r.precip_mm_mean, r.precip_mm_max,
+  r.tmean_7d, r.precip_7d, r.diurnal_7d, r.tmean_14d, r.precip_14d
+FROM cal c
+LEFT JOIN deaths  d USING (uf, date)
+LEFT JOIN wx_roll r USING (uf, date)
+ORDER BY uf, date;
+", year_min, year_max, uf_clause, year_min, year_max, uf_clause,
+   year_min, year_max, uf_clause)
+
+dat <- as.data.table(DBI::dbGetQuery(con, sql_fix))
+dat[, date := as.IDate(date)]
+```
+## 4) Check UF/rows/missing data
+```{r}
+cat("rows =", nrow(dat), "  UFs =", uniqueN(dat$uf), "\n")
+dat[, .(min_date=min(date), max_date=max(date))]
+dat[, colSums(is.na(.SD))]  # missing data counts
+```
+
+## 5) basic infromation in each UF
+```{r}
+# Nationwide data order
+nat <- dat[, .(deaths=sum(deaths)), by=date][order(date)]
+
+# Table UF
+tab_uf <- dat[, .(
+  days      = .N,
+  total     = sum(deaths),
+  mean_day  = mean(deaths),
+  p99_day   = quantile(deaths, .99),
+  max_day   = max(deaths),
+  pct_zero  = mean(deaths==0) #percentage of zero-es
+), by=uf][order(-total)]
+
+fwrite(tab_uf, "desc_table_by_UF.csv")
+tab_uf
+```
+
+## 6)  Daily and annual numbers of death
+```{r}
+# Daily death
+ggplot(nat, aes(date, deaths)) +
+  geom_line() + labs(title="Brazil daily dengue deaths", y="Deaths") +
+  theme_minimal()
+
+# Annual Death
+by_year <- dat[, .(deaths=sum(deaths)), by=.(year=year(date))]
+ggplot(by_year, aes(year, deaths)) +
+  geom_col() + labs(title="Annual deaths (Brazil)", y="Deaths") +
+  theme_minimal()
+
+```
+
+## 7) Daily deaths by UF
+```{r}
+# Annual dengue death
+ann <- dat[, .(deaths = sum(deaths, na.rm=TRUE),
+               tmean  = mean(tmean,  na.rm=TRUE),
+               precip = sum(precip_7d, na.rm=TRUE)   # 欲しければ
+              ),
+           by = .(uf, year = year(date))]
+
+# 1) Annual death trends（UF facet）
+ggplot(ann, aes(year, deaths)) +
+  geom_col() +
+  facet_wrap(~ uf, scales = "free_y") +
+  labs(title = "Annual dengue deaths by UF", x = "Year", y = "Deaths") +
+  theme_minimal()
+
+# 2) Mean annual temperature treands（UF facet）
+ggplot(ann, aes(year, tmean, group=1)) +
+  geom_line() + geom_point(size=0.8) +
+  facet_wrap(~ uf, scales = "free_y") +
+  labs(title = "Annual mean temperature by UF", x = "Year", y = "°C") +
+  theme_minimal()
+```
+
+## 8) Heatmap: weekly& annual deaths by year & UF
+```{r}
+dat[, `:=`(yr=year(date), wk=isoweek(date))]
+hm <- dat[, .(deaths=sum(deaths)), by=.(uf, yr, wk)]
+ggplot(hm, aes(wk, yr, fill=deaths)) +
+  geom_tile() + scale_fill_viridis_c() +
+  facet_wrap(~ uf) +
+  labs(title="Heatmap: weekly deaths by year & UF", x="ISO week", y="Year") +
+  theme_minimal()
+
+ann_uf <- dat[, .(deaths=sum(deaths)), by=.(uf, year=year(date))]
+ggplot(ann_uf, aes(x=year, y=uf, fill=deaths)) +
+  geom_tile() + scale_fill_viridis_c() +
+  labs(title="Heatmap: annual deaths by UF", x="Year", y="", fill="Deaths") +
+  theme_minimal()
+```
+
+## 9) Heatmap: seasonal& UF
+```{r}
+cal <- dat[, .(deaths=sum(deaths)), by=.(uf, year=year(date), month=month(date))]
+ggplot(cal, aes(month, year, fill=deaths)) +
+geom_tile() + scale_fill_viridis_c() +
+facet_wrap(~ uf, scales="free") +
+labs(title="Seasonality heatmap (monthly deaths)", x="Month", y="Year") +
+theme_minimal()
+```
+
+## 10) Total dengue deaths by UF
+```{r}
+# install.packages("geobr"); install.packages("sf")
+library(geobr); library(sf)
+
+# UF map data（または年別で by=.(uf, year) に）
+map_uf <- dat[, .(deaths=sum(deaths)), by=uf]
+
+# geobr UF polygon
+states <- geobr::read_state(showProgress=FALSE)[, c("abbrev_state","geom")]
+setnames(states, "abbrev_state", "uf")
+
+# Aggregate the state data
+m <- merge(states, map_uf, by="uf", all.x=TRUE)
+m$deaths[is.na(m$deaths)] <- 0
+
+ggplot(m) + geom_sf(aes(fill=deaths), color=NA) +
+  scale_fill_viridis_c(option="C") +
+  labs(title="Total dengue deaths by UF", fill="Deaths") +
+  theme_void()
+```
+
+## 11) outlier and missing points detection
+```{r}
+# 変数の要約（気象）
+desc_wx <- dat[, .(
+  tmean_m = mean(tmean, na.rm=TRUE),
+  tmean_q = quantile(tmean, c(.1,.5,.9), na.rm=TRUE),
+  prec7_m = mean(precip_7d, na.rm=TRUE),
+  prec7_q = quantile(precip_7d, c(.1,.5,.9), na.rm=TRUE),
+  diur_m  = mean(diurnal_7d, na.rm=TRUE)
+), by=uf]
+fwrite(desc_wx, "desc_weather_by_UF.csv")
+```
+
